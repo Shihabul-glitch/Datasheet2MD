@@ -1,0 +1,8 @@
+# Runtime (GUI frontend only - Docling is NOT a dependency of this app;
+# the installed `docling` command-line tool is called as a subprocess).
+customtkinter==6.0.0
+tkinterdnd2==0.6.3   # optional: drag & drop; the app works without it
+
+# Development / build
+pytest==9.1.1
+pyinstaller==6.22.3
