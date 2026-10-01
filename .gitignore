@@ -7,3 +7,5 @@ dist/
 *.spec
 *.log
 .d2md_work/
+.d2md_staging/
+.v2_backup/

@@ -1,14 +1,27 @@
-"""Output folder naming, versioning and safe preparation."""
+"""Output folder naming, destination reservation, staging and safe publishing.
+
+Safety rules:
+
+* An existing folder is never written into, overwritten or deleted. If the
+  folder name is taken, a new version is created (``LM358_2``, ``LM358_3``...).
+* Destinations are reserved for the whole batch, so two queued PDFs with the
+  same name (from different folders) can never claim the same folder.
+* Every document is assembled in its own staging folder on the output drive
+  and published with an atomic ``os.rename``, which fails instead of merging
+  if the name was taken in the meantime (then the next free version is used).
+  Cancelled or failed conversions are never published.
+"""
 
 from __future__ import annotations
 
 import os
 import re
+import secrets
 import shutil
-from dataclasses import dataclass
-from enum import Enum
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 from .config import IMAGES_DIRNAME, STAGING_DIRNAME
 
@@ -16,21 +29,34 @@ PathLike = Union[str, os.PathLike]
 
 # "-Datasheet", "_Datasheet", " Datasheet" (any letter case) at the end of the stem.
 _DATASHEET_SUFFIX_RE = re.compile(r"[-_ ]datasheet$", re.IGNORECASE)
+_INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10)),
+    "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³",
 }
-
-
-class ExistsPolicy(Enum):
-    NEW_VERSION = "new_version"
-    OVERWRITE = "overwrite"
-    CANCEL = "cancel"
+MAX_NAME_CHARS = 120
+LEGACY_MAX_PATH = 259  # MAX_PATH (260) minus the terminating NUL
 
 
 class OutputError(Exception):
     """Raised when the output location cannot be used."""
+
+
+# --------------------------------------------------------------------------- #
+# Names
+# --------------------------------------------------------------------------- #
+def sanitize_name(name: str, fallback: str = "datasheet") -> str:
+    """Make ``name`` a valid Windows file/folder name (never empty, never reserved)."""
+    s = _INVALID_CHARS_RE.sub("_", name or "")
+    s = s.strip().rstrip(" .")
+    if len(s) > MAX_NAME_CHARS:
+        s = s[:MAX_NAME_CHARS].rstrip(" .")
+    if not s or set(s) <= {"."}:
+        s = fallback
+    if s.split(".")[0].strip().upper() in _WINDOWS_RESERVED:
+        s = f"{s}_"
+    return s
 
 
 def component_folder_name(pdf: PathLike) -> str:
@@ -38,36 +64,20 @@ def component_folder_name(pdf: PathLike) -> str:
 
     >>> component_folder_name("BNO080_085-Datasheet.pdf")
     'BNO080_085'
-    >>> component_folder_name("STM32F103C8T6.pdf")
-    'STM32F103C8T6'
     """
     stem = Path(pdf).stem.strip()
     name = _DATASHEET_SUFFIX_RE.sub("", stem).rstrip(" ._-")
     if not name:
-        name = stem  # e.g. "Datasheet.pdf" or "-datasheet.pdf": keep the full stem
-    name = name.rstrip(" .")  # Windows forbids trailing dots/spaces
-    if not name or name.upper() in _WINDOWS_RESERVED:
-        name = f"{name or 'datasheet'}_output"
+        name = stem  # e.g. "Datasheet.pdf": keep the full stem
+    name = sanitize_name(name)
+    if name.upper() == STAGING_DIRNAME.upper():
+        name += "_output"
     return name
 
 
 def markdown_filename(pdf: PathLike) -> str:
     """Markdown name is the PDF file name with .pdf replaced by .md."""
-    return Path(pdf).stem + ".md"
-
-
-@dataclass(frozen=True)
-class OutputPlan:
-    source_pdf: Path
-    component_dir: Path
-    markdown_path: Path
-    images_dir: Path
-    staging_dir: Path
-    existed_before: bool
-
-    @property
-    def images_rel(self) -> str:
-        return IMAGES_DIRNAME
+    return sanitize_name(Path(pdf).stem) + ".md"
 
 
 def output_root_for(pdf: PathLike, output_root: Optional[PathLike]) -> Path:
@@ -77,99 +87,116 @@ def output_root_for(pdf: PathLike, output_root: Optional[PathLike]) -> Path:
     return Path(pdf).expanduser().resolve().parent
 
 
-def base_component_dir(pdf: PathLike, output_root: Optional[PathLike] = None) -> Path:
-    return output_root_for(pdf, output_root) / component_folder_name(pdf)
+def version_candidates(base: Path, limit: int = 10000) -> Iterable[Path]:
+    yield base
+    for n in range(2, limit):
+        yield base.with_name(f"{base.name}_{n}")
 
 
-def next_version_dir(base: Path) -> Path:
-    """First of base, base_2, base_3, ... that does not exist yet."""
-    if not base.exists():
-        return base
-    n = 2
-    while True:
-        candidate = base.with_name(f"{base.name}_{n}")
-        if not candidate.exists():
-            return candidate
-        n += 1
+def _key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
 
 
-def plan_output(
-    pdf: PathLike,
-    output_root: Optional[PathLike] = None,
-    policy: ExistsPolicy = ExistsPolicy.NEW_VERSION,
-) -> OutputPlan:
-    """Decide where the results go. Nothing is created or deleted here."""
-    if policy is ExistsPolicy.CANCEL:
-        raise OutputError("Conversion cancelled by user.")
-    pdf_path = Path(pdf).expanduser().resolve()
-    base = base_component_dir(pdf_path, output_root)
-    if base.exists() and not base.is_dir():
-        # A *file* with the component name exists: always pick a new name.
-        target = next_version_dir(base)
-    elif policy is ExistsPolicy.NEW_VERSION:
-        target = next_version_dir(base)
-    else:
-        target = base
-    return OutputPlan(
-        source_pdf=pdf_path,
-        component_dir=target,
-        markdown_path=target / markdown_filename(pdf_path),
-        images_dir=target / IMAGES_DIRNAME,
-        staging_dir=target / STAGING_DIRNAME,
-        existed_before=target.exists(),
-    )
-
-
-def _is_within(child: Path, parent: Path) -> bool:
-    try:
-        child.resolve().relative_to(parent.resolve())
+def long_paths_enabled() -> bool:
+    if os.name != "nt":
         return True
-    except ValueError:
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\FileSystem") as k:
+            return winreg.QueryValueEx(k, "LongPathsEnabled")[0] == 1
+    except OSError:
         return False
 
 
-def prepare_output(plan: OutputPlan) -> None:
-    """Create the component folder; when overwriting, remove only generated files.
-
-    Generated files are the Markdown file, the images/ folder and the staging
-    folder. Anything else the user put in the folder is left alone, and the
-    source PDF is never deleted.
-    """
-    src = plan.source_pdf
-    if plan.markdown_path.resolve() == src:
-        raise OutputError("Refusing to write over the source PDF.")
-    for generated in (plan.images_dir, plan.staging_dir):
-        if generated.exists() and _is_within(src, generated):
-            raise OutputError(
-                f"The source PDF is inside '{generated}', which would be replaced. "
-                "Move the PDF or choose another output folder."
-            )
-    try:
-        plan.component_dir.mkdir(parents=True, exist_ok=True)
-        if plan.existed_before:
-            if plan.markdown_path.is_file():
-                plan.markdown_path.unlink()
-            for generated in (plan.images_dir, plan.staging_dir):
-                if generated.is_dir():
-                    shutil.rmtree(generated)
-                elif generated.exists():
-                    generated.unlink()
-        plan.staging_dir.mkdir(parents=True, exist_ok=True)
-        _hide_on_windows(plan.staging_dir)
-    except PermissionError as exc:
+def check_path_lengths(target_dir: Path, markdown_name: str) -> None:
+    """Raise OutputError if the output paths would exceed the Windows path limit."""
+    if long_paths_enabled():
+        return
+    longest = max(len(str(target_dir / markdown_name)),
+                  len(str(target_dir / IMAGES_DIRNAME / "image_0001.png"))) + len("_999")
+    if longest > LEGACY_MAX_PATH:
         raise OutputError(
-            f"Permission denied while preparing '{plan.component_dir}'. "
-            "Choose a folder you can write to, or close programs using these files."
-        ) from exc
-    except OSError as exc:
-        raise OutputError(f"Output folder unavailable: {exc}") from exc
+            f"The output path would be {longest} characters long, which exceeds the Windows limit of "
+            f"{LEGACY_MAX_PATH}. Choose a shorter output folder (or rename the PDF), or enable Windows "
+            "long paths (LongPathsEnabled).")
 
 
+# --------------------------------------------------------------------------- #
+# Reservations and planning
+# --------------------------------------------------------------------------- #
+class Reservations:
+    """Thread-safe registry of destination folders claimed by queued jobs."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._owners: Dict[str, str] = {}
+
+    def reserve(self, path: Path, job_id: str) -> None:
+        with self._lock:
+            self._owners[_key(path)] = job_id
+
+    def taken_by_others(self, path: Path, job_id: str) -> bool:
+        with self._lock:
+            owner = self._owners.get(_key(path))
+        return owner is not None and owner != job_id
+
+    def release_job(self, job_id: str) -> None:
+        with self._lock:
+            for k in [k for k, v in self._owners.items() if v == job_id]:
+                del self._owners[k]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._owners.clear()
+
+
+@dataclass
+class DestinationPlan:
+    source_pdf: Path
+    root: Path
+    base_dir: Path
+    target_dir: Path
+    markdown_name: str
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def markdown_path(self) -> Path:
+        return self.target_dir / self.markdown_name
+
+
+def plan_destination(pdf: PathLike, output_root: Optional[PathLike],
+                     reservations: Optional[Reservations] = None, job_id: str = "") -> DestinationPlan:
+    """Decide (and reserve) where a PDF's results go. Nothing is created or deleted."""
+    reservations = reservations or Reservations()
+    pdf_path = Path(pdf).expanduser().resolve()
+    root = output_root_for(pdf_path, output_root)
+    base = root / component_folder_name(pdf_path)
+    md_name = markdown_filename(pdf_path)
+    target = None
+    for candidate in version_candidates(base):
+        if not candidate.exists() and not reservations.taken_by_others(candidate, job_id):
+            target = candidate
+            break
+    if target is None:
+        raise OutputError(f"Too many existing versions of '{base}'.")
+    plan = DestinationPlan(pdf_path, root, base, target, md_name)
+    if target != base:
+        why = "already used by another PDF in this batch" if not base.exists() else "already exists"
+        plan.notes.append(f"'{base.name}' {why}; writing '{target.name}' instead (nothing is overwritten).")
+    reservations.reserve(target, job_id)
+    check_path_lengths(target, md_name)
+    return plan
+
+
+# --------------------------------------------------------------------------- #
+# Staging and publishing
+# --------------------------------------------------------------------------- #
 def check_writable(directory: Path) -> None:
     """Raise OutputError if a file cannot be created in ``directory``."""
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        probe = directory / f".d2md_write_test_{os.getpid()}"
+        probe = directory / f".d2md_write_test_{os.getpid()}_{secrets.token_hex(3)}"
         probe.write_bytes(b"ok")
         probe.unlink()
     except PermissionError as exc:
@@ -188,21 +215,63 @@ def free_bytes(directory: Path) -> Optional[int]:
         return None
 
 
-def discard_output(plan: OutputPlan) -> None:
-    """Remove what a failed/cancelled run created (only a folder we created)."""
-    shutil.rmtree(plan.staging_dir, ignore_errors=True)
-    if not plan.existed_before and plan.component_dir.is_dir():
-        if not _is_within(plan.source_pdf, plan.component_dir):
-            shutil.rmtree(plan.component_dir, ignore_errors=True)
+def create_staging(root: Path, job_id: str) -> Path:
+    """A unique, hidden per-job working folder on the same drive as the output."""
+    parent = root / STAGING_DIRNAME
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        _set_hidden(parent)
+        safe_id = re.sub(r"[^A-Za-z0-9]", "", job_id)[:8] or "job"
+        stage = parent / f"{safe_id}_{os.getpid()}_{secrets.token_hex(3)}"
+        stage.mkdir()
+    except PermissionError as exc:
+        raise OutputError(f"Permission denied: cannot create a working folder in '{root}'.") from exc
+    except OSError as exc:
+        raise OutputError(f"Cannot create a working folder in '{root}': {exc}") from exc
+    return stage
 
 
-def _hide_on_windows(path: Path) -> None:
+def remove_staging(stage: Path) -> None:
+    """Delete a job's own staging folder (never a destination), then the empty parent."""
+    if stage.parent.name != STAGING_DIRNAME:
+        return  # safety: only ever delete folders created by create_staging
+    shutil.rmtree(stage, ignore_errors=True)
+    try:
+        stage.parent.rmdir()  # only succeeds when empty (another job may still use it)
+    except OSError:
+        pass
+
+
+def publish_new(staged: Path, plan: DestinationPlan, reservations: Optional[Reservations] = None,
+                job_id: str = "") -> Path:
+    """Atomically move a finished staged folder to the planned (or next free) folder.
+
+    ``os.rename`` fails when the target exists, so an existing folder is never merged into.
+    """
+    reservations = reservations or Reservations()
+    for candidate in [plan.target_dir, *version_candidates(plan.base_dir)]:
+        if candidate.exists() or reservations.taken_by_others(candidate, job_id):
+            continue
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(staged, candidate)
+        except FileExistsError:
+            continue
+        except PermissionError:
+            if candidate.exists():
+                continue
+            raise
+        reservations.reserve(candidate, job_id)
+        return candidate
+    raise OutputError(f"No free output folder name for '{plan.base_dir}'.")
+
+
+def _set_hidden(path: Path) -> None:
     if os.name != "nt":
         return
     try:
         import ctypes
 
-        FILE_ATTRIBUTE_HIDDEN = 0x02
-        ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_HIDDEN)
+        ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)  # FILE_ATTRIBUTE_HIDDEN
     except Exception:
         pass

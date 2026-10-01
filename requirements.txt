@@ -1,5 +1,6 @@
-# Runtime (GUI frontend only - Docling is NOT a dependency of this app;
-# the installed `docling` command-line tool is called as a subprocess).
+# Runtime (GUI frontend only). Docling is NOT a dependency of this app: the app runs its
+# small worker script (core/docling_worker.py) with the Python of the installed `docling`
+# (verified: Docling 2.131.0, PyTorch 2.14.0+cpu, Python 3.10). See README "Setup".
 customtkinter==6.0.0
 tkinterdnd2==0.6.3   # optional: drag & drop; the app works without it
 

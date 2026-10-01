@@ -62,10 +62,26 @@ def test_i2c_not_in_code_fence():
 
 # ------------------------------------------------------------------ page artifacts
 def test_page_numbers_removed():
-    md = "Text\n\nPage 3 of 40\n\n- 4 -\n\n12 / 40\n\nMore\n"
+    md = "Text\n\nPage 3 of 40\n\n- 4 -\n\nMore\n"
     out, n = remove_page_artifacts(md)
-    assert n == 3 and "Page 3" not in out and "- 4 -" not in out and "12 / 40" not in out
+    assert n == 2 and "Page 3" not in out and "- 4 -" not in out
     assert "Text" in out and "More" in out
+
+
+def test_bare_fraction_kept_unless_repeated_as_page_counter():
+    lone = "Duty cycle\n\n1 / 4\n\nEnd\n"
+    assert remove_page_artifacts(lone) == (lone, 0)
+    md = "A\n\n12 / 40\n\nB\n\n13 / 40\n\nC\n\n14 of 40\n\nD\n\n1 / 4\n"
+    out, n = remove_page_artifacts(md)
+    assert n == 3 and "/ 40" not in out and "of 40" not in out and "1 / 4" in out
+
+
+def test_cleanup_rules_individually_switchable():
+    from core.markdown_cleaner import CleanupOptions
+
+    md = "I 2 C\n\nPage 2\n\nx\n"
+    out, report = clean_markdown(md, True, CleanupOptions(i2c=False))
+    assert "I 2 C" in out and "Page 2" not in out and report.i2c_fixed == 0
 
 
 def test_repeated_footer_keeps_first_occurrence():

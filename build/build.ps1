@@ -3,9 +3,10 @@
     Build Datasheet2MD.exe with PyInstaller.
 
 .DESCRIPTION
-    Packages ONLY the GUI frontend (CustomTkinter + tkinterdnd2). Docling, PyTorch
-    and the Docling models are intentionally NOT bundled: the executable calls the
-    `docling` command already installed on this computer.
+    Packages ONLY the GUI/CLI frontend (CustomTkinter, tkinterdnd2) and the small
+    engine-worker script. Docling, PyTorch and the Docling models are intentionally
+    NOT bundled: the executable runs the Docling installation (and model cache)
+    already present on the computer.
 
     Release -> dist\Datasheet2MD.exe        (one file, no console window)
     Debug   -> dist\Datasheet2MD-Debug.exe  (one file, with a console for diagnostics)
@@ -20,7 +21,8 @@ param(
     [ValidateSet("Release", "Debug", "Both")]
     [string]$Mode = "Release",
     [switch]$SkipTests,
-    [switch]$SkipInstall
+    [switch]$SkipInstall,
+    [switch]$SkipSelfTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,6 +70,8 @@ $Common = @(
     "--add-data", "$Icon;assets",
     "--collect-data", "customtkinter",      # themes (json) and fonts
     "--collect-all", "tkinterdnd2",         # native tkdnd library for drag & drop
+    "--add-data", "$(Join-Path $Root 'core\docling_worker.py');core",  # runs inside Docling's Python
+    "--exclude-module", "torch", "--exclude-module", "docling", "--exclude-module", "numpy", "--exclude-module", "pypdfium2",
     "--workpath", $Work,
     "--specpath", $Work,
     "--distpath", $Dist,
@@ -83,9 +87,25 @@ function Invoke-Build([string]$Name, [string[]]$Extra) {
     if (-not (Test-Path $exe)) { throw "Expected output not found: $exe" }
     $mb = [math]::Round((Get-Item $exe).Length / 1MB, 1)
     Write-Host "   -> $exe ($mb MB)" -ForegroundColor Green
+    if ($mb -gt 60) { throw "$Name.exe is $mb MB - something heavy (torch/Docling?) was bundled by mistake." }
+}
+
+function Test-Exe([string]$Name) {
+    # Starts the packaged EXE with --self-test: checks pdfium, the bundled worker script
+    # and Docling detection from the frozen executable. Exit 0 = ready, 3 = problems.
+    $exe = Join-Path $Dist "$Name.exe"
+    Write-Host "== Self-test: $Name.exe --self-test" -ForegroundColor Cyan
+    $p = Start-Process -FilePath $exe -ArgumentList "--self-test" -Wait -PassThru -NoNewWindow
+    if ($p.ExitCode -eq 0) { Write-Host "   self-test OK" -ForegroundColor Green }
+    elseif ($p.ExitCode -eq 3) { Write-Warning "$Name.exe starts, but Docling/pdfium is not ready on this PC (exit 3)." }
+    else { throw "$Name.exe --self-test failed with exit code $($p.ExitCode)" }
 }
 
 if ($Mode -in @("Release", "Both")) { Invoke-Build "Datasheet2MD" @("--noconsole") }
 if ($Mode -in @("Debug", "Both"))   { Invoke-Build "Datasheet2MD-Debug" @("--console") }
+if (-not $SkipSelfTest) {
+    if ($Mode -in @("Debug", "Both"))   { Test-Exe "Datasheet2MD-Debug" }
+    if ($Mode -in @("Release", "Both")) { Test-Exe "Datasheet2MD" }
+}
 
 Write-Host "== Done" -ForegroundColor Green

@@ -10,23 +10,26 @@ from pathlib import Path
 from typing import Optional
 
 APP_NAME = "Datasheet2MD"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.1.0"
 APP_SUBTITLE = "Electronic Datasheet → Markdown"
 
 IMAGES_DIRNAME = "images"
-STAGING_DIRNAME = ".d2md_work"
+STAGING_DIRNAME = ".d2md_staging"  # per-output-root parent of the per-job staging folders
 STAGING_PDF_NAME = "source.pdf"  # ASCII-only copy handed to Docling
-DEBUG_REPORT_NAME = "_datasheet2md_debug_report.json"
+
+# Docling version this release was verified against (other 2.x versions are used as-is).
+DOCLING_TESTED_VERSION = "2.131.0"
 
 # Environment passed to the Docling subprocess. The Hugging Face settings keep
-# any model download on plain HTTP with generous timeouts (Xet transfers have
-# failed on this machine before); UTF-8 settings make log capture reliable.
+# any model download on plain HTTP with generous timeouts; UTF-8 settings make
+# log capture reliable.
 DOCLING_ENV_OVERRIDES = {
     "HF_HUB_DISABLE_XET": "1",
     "HF_HUB_DOWNLOAD_TIMEOUT": "600",
     "HF_HUB_ETAG_TIMEOUT": "60",
     "PYTHONIOENCODING": "utf-8",
     "PYTHONUTF8": "1",
+    "PYTHONUNBUFFERED": "1",
     "NO_COLOR": "1",
     "TERM": "dumb",
     "COLUMNS": "200",
@@ -40,8 +43,8 @@ REQUIRED_MODEL_FILES = (
     / "tableformer_accurate.safetensors",
 )
 
-# Minimum free disk space before starting (bytes).
 MIN_FREE_BYTES = 50 * 1024 * 1024
+DEVICES = ("auto", "cpu", "gpu")
 
 
 def resource_path(relative: str) -> Path:
@@ -59,6 +62,10 @@ def settings_path() -> Path:
     return app_data_dir() / "settings.json"
 
 
+def queue_state_path() -> Path:
+    return app_data_dir() / "queue.json"
+
+
 def logs_dir() -> Path:
     return app_data_dir() / "logs"
 
@@ -72,11 +79,10 @@ def models_dir_is_complete(path: Path) -> bool:
 
 
 def resolve_artifacts_path(setting: str = "auto") -> Optional[Path]:
-    """Return the model folder to pass as ``--artifacts-path`` or None.
+    """Return the model folder to pass to Docling (``artifacts_path``) or None.
 
-    ``setting`` is ``"auto"`` (use DOCLING_ARTIFACTS_PATH or the default
-    docling-tools download folder when complete), ``"none"`` (never pass it),
-    or an explicit folder path.
+    ``"auto"``: DOCLING_ARTIFACTS_PATH or the default docling-tools download
+    folder when complete; ``"none"``: never; otherwise an explicit folder.
     """
     setting = (setting or "auto").strip()
     if setting.lower() == "none":
@@ -94,13 +100,28 @@ def resolve_artifacts_path(setting: str = "auto") -> Optional[Path]:
 
 @dataclass
 class Settings:
+    # main window
     last_input_dir: str = ""
-    last_output_dir: str = ""  # "" means "same directory as source PDF"
-    ocr_enabled: bool = False
+    last_output_dir: str = ""  # output root folder
+    output_beside_source: bool = True
+    include_subfolders: bool = False
+    ocr_enabled: bool = False  # "Scanned PDF / Enable OCR" (same key as v1.0)
+    # Settings dialog / settings.json
+    device: str = "auto"  # auto | cpu | gpu
+    gpu_verified: str = ""  # "<gpu>|<torch>|<docling>" after a successful GPU test conversion
     llm_cleanup: bool = True
-    debug_mode: bool = False
+    cleanup_i2c: bool = True
+    cleanup_page_artifacts: bool = True
+    cleanup_captions: bool = True
+    cleanup_whitespace: bool = True
+    debug_mode: bool = False  # keep the staging folder and log Docling at debug level
+    engine_backend: str = "auto"  # auto (persistent worker) | cli (docling.exe per document)
+    worker_recycle_mb: int = 0  # 0 = automatic (25 % of RAM, 1.5-4 GB)
+    num_threads: int = 0  # 0 = Docling default (4)
     artifacts_path: str = "auto"
     docling_path: str = ""  # optional explicit docling.exe override
+    window_geometry: str = ""
+    show_log: bool = False
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "Settings":
@@ -111,17 +132,37 @@ class Settings:
             return cls()
         if not isinstance(data, dict):
             return cls()
-        known = {f.name: f.type for f in fields(cls)}
+        known = {f.name for f in fields(cls)}
+        defaults = cls()
         clean = {}
         for key, value in data.items():
             if key not in known:
-                continue
-            default = getattr(cls(), key)
-            if isinstance(default, bool) and isinstance(value, bool):
-                clean[key] = value
+                continue  # settings of removed features (v2.0 ocr_mode, collision_policy, ...) are ignored
+            default = getattr(defaults, key)
+            if isinstance(default, bool):
+                if isinstance(value, bool):
+                    clean[key] = value
+            elif isinstance(default, int):
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    clean[key] = value
             elif isinstance(default, str) and isinstance(value, str):
                 clean[key] = value
-        return cls(**clean)
+        settings = cls(**clean)
+        # v2.0 stored the OCR choice as ocr_mode (and always wrote ocr_enabled=false).
+        # Auto OCR was removed in 2.1: only an explicit "on"/"force" keeps OCR enabled.
+        if "ocr_mode" in data:
+            settings.ocr_enabled = data.get("ocr_mode") in ("on", "force")
+        if "output_beside_source" not in data and settings.last_output_dir:
+            settings.output_beside_source = False  # v1.0 used a custom output folder
+        settings.normalize()
+        return settings
+
+    def normalize(self) -> None:
+        if self.device not in DEVICES:
+            self.device = "auto"
+        if self.engine_backend not in ("auto", "worker", "cli"):
+            self.engine_backend = "auto"
+        self.num_threads = max(0, min(int(self.num_threads), 64))
 
     def save(self, path: Optional[Path] = None) -> None:
         path = path or settings_path()

@@ -23,7 +23,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import unquote_to_bytes
 
 from .image_manager import HTML_IMG_RE, MD_IMAGE_RE, fenced_code_spans
@@ -44,10 +44,14 @@ _MIME_EXT = {
 # Plain "I2C" is left alone (it is correct and often part of identifiers).
 _I2C_RE = re.compile(r"(?<![\w/])I(?: 2 ?C| ?2 C)(?!\w)")
 
+# Unambiguous page labels: "Page 3", "Page 3 of 40", "- 3 -".
 _PAGE_NUMBER_RE = re.compile(
-    r"^(?:page\s*\d{1,4}(?:\s*(?:of|/)\s*\d{1,4})?|\d{1,4}\s*(?:of|/)\s*\d{1,4}|[-–—]\s*\d{1,4}\s*[-–—])$",
+    r"^(?:page\s*\d{1,4}(?:\s*(?:of|/)\s*\d{1,4})?|[-–—]\s*\d{1,4}\s*[-–—])$",
     re.IGNORECASE,
 )
+# Bare "3 / 40" or "3 of 40": only treated as a page label when the same total
+# appears on at least 3 such lines (a lone "1/4" may be a technical value).
+_BARE_PAGE_OF_RE = re.compile(r"^(\d{1,4})\s*(?:of|/)\s*(\d{1,4})$", re.IGNORECASE)
 _FOOTER_KEYWORD_RE = re.compile(
     r"(©|\(c\)\s*\d{4}|copyright|all rights reserved|confidential|proprietary|"
     r"www\.|https?://|document\s*(?:no\.?|number|#)|doc\.?\s*#|\brev(?:ision)?\.?\s*[\dA-Z][\w.]*|"
@@ -204,8 +208,9 @@ def normalize_i2c(md: str) -> Tuple[str, int]:
 def remove_page_artifacts(md: str) -> Tuple[str, int]:
     """Remove standalone page-number lines and repeated running headers/footers.
 
-    * A plain paragraph consisting only of "Page 3", "Page 3 of 40", "3 / 40",
-      "- 3 -" is removed.
+    * A plain paragraph consisting only of "Page 3", "Page 3 of 40" or "- 3 -"
+      is removed; a bare "3 / 40" or "3 of 40" only when at least three such
+      lines share the same total (so a lone value like "1/4" is kept).
     * A short plain paragraph (<= 100 chars) that occurs at least 3 times and
       looks like a running header/footer (copyright, "Rev 1.2", URL, document
       number, "... Datasheet") keeps its first occurrence; repeats are removed.
@@ -216,6 +221,7 @@ def remove_page_artifacts(md: str) -> Tuple[str, int]:
     candidates: Counter = Counter()
     prose_idx: List[int] = []
     page_idx: List[int] = []
+    bare_idx: Dict[str, List[int]] = {}
     for i, line in enumerate(lines):
         m = _FENCE_RE.match(line)
         if fence is not None:
@@ -226,13 +232,19 @@ def remove_page_artifacts(md: str) -> Tuple[str, int]:
             fence = m.group(1)
             continue
         s = line.strip()
+        bare = _BARE_PAGE_OF_RE.match(s)
         if s and not s.startswith(("|", "#")) and _PAGE_NUMBER_RE.match(s):
             page_idx.append(i)
+        elif bare and int(bare.group(1)) <= int(bare.group(2)):
+            bare_idx.setdefault(bare.group(2), []).append(i)
         elif _is_plain_paragraph(line):
             prose_idx.append(i)
             candidates[s] += 1
 
     remove = set(page_idx)
+    for total, idxs in bare_idx.items():
+        if len(idxs) >= 3:
+            remove.update(idxs)
     seen = set()
     for i in prose_idx:
         s = lines[i].strip()
@@ -337,14 +349,32 @@ def basic_normalize(md: str) -> str:
     return md.rstrip("\n") + "\n"
 
 
-def clean_markdown(md: str, llm_friendly: bool = True) -> Tuple[str, CleanReport]:
+@dataclass
+class CleanupOptions:
+    """Individual "LLM-friendly" rules; all conservative, all switchable."""
+    i2c: bool = True
+    page_artifacts: bool = True
+    captions: bool = True
+    whitespace: bool = True
+
+    def enabled_rules(self) -> List[str]:
+        return [name for name in ("i2c", "page_artifacts", "captions", "whitespace") if getattr(self, name)]
+
+
+def clean_markdown(md: str, llm_friendly: bool = True,
+                   options: Optional[CleanupOptions] = None) -> Tuple[str, CleanReport]:
     """Text cleanup after images are normalized. Never alters technical values."""
     report = CleanReport()
+    opts = options or CleanupOptions()
     md = basic_normalize(md)
     if llm_friendly:
-        md, report.i2c_fixed = normalize_i2c(md)
-        md, report.page_artifacts_removed = remove_page_artifacts(md)
-        md, report.captions_added = add_caption_alt_text(md)
-        md, report.blank_lines_removed = normalize_whitespace(md)
+        if opts.i2c:
+            md, report.i2c_fixed = normalize_i2c(md)
+        if opts.page_artifacts:
+            md, report.page_artifacts_removed = remove_page_artifacts(md)
+        if opts.captions:
+            md, report.captions_added = add_caption_alt_text(md)
+        if opts.whitespace:
+            md, report.blank_lines_removed = normalize_whitespace(md)
         md = basic_normalize(md)
     return md, report

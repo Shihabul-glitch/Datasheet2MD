@@ -50,6 +50,7 @@ class ImageRef:
 class ImageResult:
     markdown: str
     image_files: List[Path] = field(default_factory=list)  # in numbering order
+    sources: List[Path] = field(default_factory=list)  # original file of each image_files entry
     missing: List[str] = field(default_factory=list)
     remote: List[str] = field(default_factory=list)
     duplicates: int = 0
@@ -200,6 +201,7 @@ def normalize_images(md: str, base_dir: Path, images_dir: Path, rel_prefix: str 
             raise ImageError(f"Cannot copy image '{src.name}' to '{dest}': {exc}") from exc
         names[key] = name
         result.image_files.append(dest)
+        result.sources.append(src)
 
     out: List[str] = []
     pos = 0

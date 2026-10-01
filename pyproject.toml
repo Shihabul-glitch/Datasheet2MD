@@ -1,6 +1,6 @@
 [project]
 name = "datasheet2md"
-version = "1.0.0"
+version = "2.1.0"
 description = "Convert electronic-component PDF datasheets into clean, LLM-friendly Markdown using a local Docling installation."
 readme = "README.md"
 requires-python = ">=3.10"

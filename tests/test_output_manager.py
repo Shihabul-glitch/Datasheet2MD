@@ -1,16 +1,18 @@
-from pathlib import Path
+import os
 
 import pytest
 
 from core.output_manager import (
-    ExistsPolicy,
     OutputError,
+    Reservations,
+    check_path_lengths,
     component_folder_name,
-    discard_output,
+    create_staging,
     markdown_filename,
-    next_version_dir,
-    plan_output,
-    prepare_output,
+    plan_destination,
+    publish_new,
+    remove_staging,
+    sanitize_name,
 )
 
 
@@ -29,6 +31,7 @@ from core.output_manager import (
         ("TPS63020 (rev B).pdf", "TPS63020 (rev B)", "TPS63020 (rev B).md"),
         ("µ-Sensor & Co_Datasheet.pdf", "µ-Sensor & Co", "µ-Sensor & Co_Datasheet.md"),
         ("MyDatasheet.pdf", "MyDatasheet", "MyDatasheet.md"),  # no separator: not a suffix
+        ("传感器 BMI270-datasheet.pdf", "传感器 BMI270", "传感器 BMI270-datasheet.md"),
     ],
 )
 def test_names(pdf, folder, md):
@@ -36,92 +39,106 @@ def test_names(pdf, folder, md):
     assert markdown_filename(pdf) == md
 
 
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("CON", "CON_"), ("nul", "nul_"), ("COM1.backup", "COM1.backup_"), ("LPT9", "LPT9_"),
+        ("name. . ", "name"), ("  spaced  ", "spaced"), ('a<b>c:d"e|f?g*h', "a_b_c_d_e_f_g_h"),
+        ("tab\there", "tab_here"), ("...", "datasheet"), ("", "datasheet"), ("CONSOLE", "CONSOLE"),
+    ],
+)
+def test_sanitize_name(raw, expected):
+    assert sanitize_name(raw) == expected
+
+
+def test_reserved_and_trailing_dot_pdf_names():
+    assert component_folder_name("CON.pdf") == "CON_"
+    assert component_folder_name("AUX-Datasheet.pdf") == "AUX_"
+    assert markdown_filename("NUL.pdf") == "NUL_.md"
+    assert component_folder_name("chip..pdf") == "chip"
+    assert len(component_folder_name("x" * 300 + ".pdf")) <= 120
+
+
 def test_name_from_full_path():
     assert component_folder_name(r"C:\some dir\BNO080_085-Datasheet.pdf") == "BNO080_085"
 
 
-def test_next_version_dir(tmp_path):
-    base = tmp_path / "BNO080_085"
-    assert next_version_dir(base) == base
-    base.mkdir()
-    assert next_version_dir(base).name == "BNO080_085_2"
-    (tmp_path / "BNO080_085_2").mkdir()
-    assert next_version_dir(base).name == "BNO080_085_3"
-
-
-def _pdf(tmp_path, name="BNO080_085-Datasheet.pdf"):
-    p = tmp_path / name
+def _pdf(folder, name="BNO080_085-Datasheet.pdf"):
+    folder.mkdir(parents=True, exist_ok=True)
+    p = folder / name
     p.write_bytes(b"%PDF-1.7\n")
     return p
 
 
-def test_plan_defaults_to_pdf_directory(tmp_path):
-    plan = plan_output(_pdf(tmp_path))
-    assert plan.component_dir == tmp_path.resolve() / "BNO080_085"
+def test_plan_beside_pdf_and_custom_root(tmp_path):
+    pdf = _pdf(tmp_path)
+    plan = plan_destination(pdf, None)
+    assert plan.target_dir == tmp_path.resolve() / "BNO080_085"
     assert plan.markdown_path.name == "BNO080_085-Datasheet.md"
-    assert plan.images_dir == plan.component_dir / "images"
-    assert not plan.existed_before
-
-
-def test_plan_custom_output_root(tmp_path):
     out = tmp_path / "out dir"
-    plan = plan_output(_pdf(tmp_path), out)
-    assert plan.component_dir == out.resolve() / "BNO080_085"
+    assert plan_destination(pdf, out).target_dir == out.resolve() / "BNO080_085"
 
 
-def test_new_version_policy(tmp_path):
-    pdf = _pdf(tmp_path)
-    (tmp_path / "BNO080_085").mkdir()
-    plan = plan_output(pdf, policy=ExistsPolicy.NEW_VERSION)
-    assert plan.component_dir.name == "BNO080_085_2"
+def test_duplicate_stems_from_different_folders_get_distinct_reserved_folders(tmp_path):
+    a = _pdf(tmp_path / "a", "LM358.pdf")
+    b = _pdf(tmp_path / "b", "LM358.pdf")
+    out = tmp_path / "out"
+    res = Reservations()
+    pa = plan_destination(a, out, res, "job-a")
+    pb = plan_destination(b, out, res, "job-b")
+    assert pa.target_dir.name == "LM358" and pb.target_dir.name == "LM358_2"
+    # re-planning the same job keeps its own reservation
+    assert plan_destination(a, out, res, "job-a").target_dir.name == "LM358"
+    # an existing folder (e.g. a previous run) is never reused
+    (out / "LM358_3").mkdir(parents=True)
+    pc = plan_destination(_pdf(tmp_path / "c", "LM358.pdf"), out, res, "job-c")
+    assert pc.target_dir.name == "LM358_4" and pc.notes
 
 
-def test_cancel_policy(tmp_path):
-    with pytest.raises(OutputError):
-        plan_output(_pdf(tmp_path), policy=ExistsPolicy.CANCEL)
+def _staged(tmp_path, files, name="stage"):
+    stage = tmp_path / name
+    for rel, content in files.items():
+        p = stage / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+    return stage
 
 
-def test_overwrite_removes_only_generated_files(tmp_path):
-    pdf = _pdf(tmp_path)
-    comp = tmp_path / "BNO080_085"
-    (comp / "images").mkdir(parents=True)
-    (comp / "images" / "image_001.png").write_bytes(b"x")
-    (comp / "BNO080_085-Datasheet.md").write_text("old")
-    (comp / "my_notes.txt").write_text("keep me")
-    plan = plan_output(pdf, policy=ExistsPolicy.OVERWRITE)
-    assert plan.component_dir == comp.resolve() and plan.existed_before
-    prepare_output(plan)
-    assert not plan.markdown_path.exists()
-    assert not (comp / "images").exists()
-    assert (comp / "my_notes.txt").read_text() == "keep me"
-    assert plan.staging_dir.is_dir()
-    assert pdf.read_bytes() == b"%PDF-1.7\n"
+def test_publish_new_is_atomic_rename_and_never_merges(tmp_path):
+    pdf = _pdf(tmp_path / "src")
+    out = tmp_path / "out"
+    plan = plan_destination(pdf, out)
+    # someone creates the folder after planning: publish must pick another name, not merge
+    plan.target_dir.mkdir(parents=True)
+    (plan.target_dir / "user.txt").write_text("mine")
+    stage = _staged(tmp_path, {"a.md": b"x"})
+    final = publish_new(stage, plan)
+    assert final.name == "BNO080_085_2" and (final / "a.md").exists()
+    assert sorted(os.listdir(plan.target_dir)) == ["user.txt"]
 
 
-def test_overwrite_never_deletes_source_pdf_inside_images(tmp_path):
-    comp = tmp_path / "X"
-    (comp / "images").mkdir(parents=True)
-    pdf = comp / "images" / "X-Datasheet.pdf"
-    pdf.write_bytes(b"%PDF-1.7\n")
-    plan = plan_output(pdf, tmp_path, ExistsPolicy.OVERWRITE)
-    with pytest.raises(OutputError):
-        prepare_output(plan)
-    assert pdf.exists()
+def test_staging_is_unique_and_removed(tmp_path):
+    a = create_staging(tmp_path, "job1")
+    b = create_staging(tmp_path, "job1")
+    assert a != b and a.parent == b.parent
+    remove_staging(a)
+    assert not a.exists() and b.exists()
+    remove_staging(b)
+    assert not b.parent.exists()
 
 
-def test_discard_removes_new_folder_but_not_existing(tmp_path):
-    pdf = _pdf(tmp_path)
-    plan = plan_output(pdf)
-    prepare_output(plan)
-    discard_output(plan)
-    assert not plan.component_dir.exists()
-    assert pdf.exists()
+def test_remove_staging_refuses_foreign_folder(tmp_path):
+    victim = tmp_path / "important"
+    victim.mkdir()
+    remove_staging(victim)
+    assert victim.exists()
 
-    comp = tmp_path / "BNO080_085"
-    comp.mkdir()
-    (comp / "keep.txt").write_text("k")
-    plan2 = plan_output(pdf, policy=ExistsPolicy.OVERWRITE)
-    prepare_output(plan2)
-    discard_output(plan2)
-    assert (comp / "keep.txt").exists()
-    assert not plan2.staging_dir.exists()
+
+def test_path_length_check(tmp_path, monkeypatch):
+    import core.output_manager as om
+
+    monkeypatch.setattr(om, "long_paths_enabled", lambda: False)
+    with pytest.raises(OutputError, match="Windows limit"):
+        check_path_lengths(tmp_path / ("d" * 230), "x.md")
+    check_path_lengths(tmp_path / "short", "x.md")
+
